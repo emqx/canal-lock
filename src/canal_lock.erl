@@ -3,11 +3,14 @@
 %%
 %%% N.B. All the buckets are tried sequentially in order for us to minimize the
 %%% amount of work needed to decrement without error.
+
 -module(canal_lock).
+
 -behaviour(gen_server).
 
--export([start_link/1, acquire/3, release/3, stop/0]).
--export([start_link/2, acquire/4, release/4, stop/1]).
+-export([start_link/1, start_link/2, acquire/3, acquire/4,
+         release/3, release/4, stop/0, stop/1]).
+
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          code_change/3, terminate/2]).
 
@@ -137,45 +140,47 @@ init({Name, MaxMultiplier}) ->
     %% `{{Pid,Key},Ref}' for proper releases.
     Refs = ets:new(lock_refs, [bag, protected]),
     Locks = ets:new(Name, [named_table, public, set, {write_concurrency, true}]),
-    {ok, #state{locks=Locks,
-                refs=Refs,
-                mod=MaxMultiplier}}.
+    {ok, #state{locks = Locks, refs = Refs, mod = MaxMultiplier}}.
 
-handle_call({unlock, Pid, Key}, _From, S=#state{refs=Tab}) ->
+handle_call({unlock, Pid, Key}, _From, State = #state{refs = Tab}) ->
     case ets:lookup(Tab, {Pid, Key}) of
         [{{Pid,Key}, Ref}|_] -> % pick any ref
             %% Clean up the refs for when the process dies. We
             %% don't clean up from the queue because we don't need to.
             ets:delete(Tab, Ref),
             ets:delete_object(Tab, {{Pid,Key},Ref}),
-            erlang:demonitor(Ref),
-            {reply, ok, S};
+            erlang:demonitor(Ref, [flush]),
+            {reply, ok, State};
         [] -> %% This is bad
             error_logger:error_msg("mod=canal_lock at=unlock "
                                    "error=unexpected_unlock key=~p~n",
                                    [Key]),
-            {reply, ok, S}
+            {reply, ok, State}
     end;
-handle_call(stop, _From, S=#state{}) ->
-    %% debug termination of server
-    {stop, normal, ok, S};
-handle_call(Call, _From, S=#state{}) ->
-    error_logger:warning_msg("mod=canal_lock at=handle_call "
-                             "warning=unexpected_msg message=~p~n",
-                             [Call]),
-    {noreply, S}.
 
-handle_cast({lock, Pid, Key}, S=#state{refs=Tab}) ->
+handle_call(stop, _From, State = #state{}) ->
+    %% debug termination of server
+    {stop, normal, ok, State};
+
+handle_call(Call, _From, State = #state{}) ->
+    error_logger:error_msg("mod=canal_lock at=handle_call "
+                           "warning=unexpected_msg message=~p~n",
+                            [Call]),
+    {noreply, State}.
+
+handle_cast({lock, Pid, Key}, State = #state{refs = Tab}) ->
     Ref = erlang:monitor(process, Pid),
     ets:insert(Tab, [{{Pid,Key},Ref}, {Ref,Key}]),
-    {noreply, S};
-handle_cast(Cast, S=#state{}) ->
+    {noreply, State};
+
+handle_cast(Cast, State = #state{}) ->
     error_logger:warning_msg("mod=canal_lock at=handle_cast "
                              "warning=unexpected_msg message=~p~n",
                              [Cast]),
-    {noreply, S}.
+    {noreply, State}.
 
-handle_info({'DOWN', Ref, process, Pid, _Reason}, S=#state{refs=Tab, mod=Mod, locks=Locks}) ->
+handle_info({'DOWN', Ref, process, Pid, _Reason},
+            State = #state{refs = Tab, mod = Mod, locks = Locks}) ->
     case ets:lookup(Tab, Ref) of
         [{Ref,Key}] ->
             ets:delete(Tab, Ref),
@@ -193,19 +198,19 @@ handle_info({'DOWN', Ref, process, Pid, _Reason}, S=#state{refs=Tab, mod=Mod, lo
             %% is a made-up message, but we can't account for that.
             ok
     end,
-    {noreply, S};
-handle_info(Info, S=#state{}) ->
+    {noreply, State};
+
+handle_info(Info, State) ->
     error_logger:warning_msg("mod=canal_lock at=handle_info "
                              "warning=unexpected_msg message=~p~n",
                              [Info]),
-    {noreply, S}.
+    {noreply, State}.
 
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
 
 terminate(_Reason, _State) ->
     ok.
-
 
 release_loop(Name, Key, MaxPer) ->
     HighestBucket = find_highest_bucket(Name, Key),
@@ -214,7 +219,7 @@ release_loop(Name, Key, MaxPer) ->
 release_loop(Name, Key, MaxPer, NumResources, Bucket) ->
     %% This bucket should exist, otherwise we're leaking connections
     %% anyway and will need to think hard about solving it.
-    N = ets:update_counter(Name, {Key,Bucket}, {2, -1}),
+    N = ets:update_counter(Name, {Key, Bucket}, {2, -1}),
     if N < MaxPer, N >= 0 ->
            ok;
        N =:= MaxPer ->
@@ -234,7 +239,8 @@ release_loop(Name, Key, MaxPer, NumResources, Bucket) ->
            release_loop(Name, Key, MaxPer, NumResources, Bucket-1)
     end.
 
-release_loop_inner(Name, Key, Max) -> release_loop_inner(Name, Key, Max, ?MAX_DECR_TRIES).
+release_loop_inner(Name, Key, Max) ->
+    release_loop_inner(Name, Key, Max, ?MAX_DECR_TRIES).
 
 release_loop_inner(Name, Key, _Max, 0) ->
     ets:update_counter(Name, Key, {2, -2, 0, 0});
@@ -262,3 +268,4 @@ lock_counter(N, Bucket, Cap) ->
     FirstBucketCorrection = -1*BucketsFull, % on 1st bucket, start at 1, not 0.
     Current = N + FirstBucketCorrection,
     Current + BelowBucketsCount.
+

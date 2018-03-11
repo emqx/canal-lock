@@ -148,8 +148,8 @@ handle_call({unlock, Pid, Key}, _From, State = #state{refs = Tab}) ->
             %% Clean up the refs for when the process dies. We
             %% don't clean up from the queue because we don't need to.
             ets:delete(Tab, Ref),
-            ets:delete_object(Tab, {{Pid,Key},Ref}),
-            erlang:demonitor(Ref, [flush]),
+            ets:delete_object(Tab, {{Pid,Key}, Ref}),
+            erlang:demonitor(Ref),
             {reply, ok, State};
         [] -> %% This is bad
             error_logger:error_msg("mod=canal_lock at=unlock "
